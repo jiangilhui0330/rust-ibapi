@@ -106,11 +106,6 @@ const UNSET_DOUBLE: &str = "1.7976931348623157E308";
 const UNSET_INTEGER: &str = "2147483647";
 const UNSET_LONG: &str = "9223372036854775807";
 
-// Index of message text in the response message
-pub(crate) const MESSAGE_INDEX: usize = 4;
-// Index of message code in the response message
-pub(crate) const CODE_INDEX: usize = 3;
-
 /// Messages emitted by TWS/Gateway over the market data socket.
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub enum IncomingMessages {
@@ -416,12 +411,13 @@ pub fn request_id_index(kind: IncomingMessages) -> Option<usize> {
         IncomingMessages::AccountUpdateMultiEnd => Some(2),
         IncomingMessages::ContractData => Some(1),
         IncomingMessages::ContractDataEnd => Some(2),
-        IncomingMessages::Error => Some(2),
+        // Error uses version-dependent indices; use ResponseMessage::error_request_id() instead.
         IncomingMessages::ExecutionData => Some(1),
         IncomingMessages::ExecutionDataEnd => Some(2),
         IncomingMessages::HeadTimestamp => Some(1),
         IncomingMessages::HistogramData => Some(1),
         IncomingMessages::HistoricalData => Some(1),
+        IncomingMessages::HistoricalDataEnd => Some(1),
         IncomingMessages::HistoricalDataUpdate => Some(1),
         IncomingMessages::HistoricalNews => Some(1),
         IncomingMessages::HistoricalNewsEnd => Some(1),
@@ -827,6 +823,8 @@ pub struct ResponseMessage {
     pub i: usize,
     /// Raw field buffer backing this message.
     pub fields: Vec<String>,
+    /// Server version for version-gated decoding (e.g. error message format).
+    pub server_version: i32,
 }
 
 impl ResponseMessage {
@@ -888,6 +886,19 @@ impl ResponseMessage {
     pub fn peek_int(&self, i: usize) -> Result<i32, Error> {
         if i >= self.fields.len() {
             return Err(Error::Simple("expected int and found end of message".into()));
+        }
+
+        let field = &self.fields[i];
+        match field.parse() {
+            Ok(val) => Ok(val),
+            Err(err) => Err(Error::Parse(i, field.into(), err.to_string())),
+        }
+    }
+
+    /// Peek a long field without advancing the cursor.
+    pub fn peek_long(&self, i: usize) -> Result<i64, Error> {
+        if i >= self.fields.len() {
+            return Err(Error::Simple("expected long and found end of message".into()));
         }
 
         let field = &self.fields[i];
@@ -1056,11 +1067,70 @@ impl ResponseMessage {
         }
     }
 
+    /// Offset applied to error field indices based on server version.
+    /// New format (>= ERROR_TIME) drops the version field, shifting indices by -1.
+    fn error_field_offset(&self) -> usize {
+        if self.server_version >= crate::server_versions::ERROR_TIME {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// Field index of the request ID in an error message.
+    pub fn error_request_id_index(&self) -> usize {
+        1 + self.error_field_offset()
+    }
+
+    /// Field index of the error code in an error message.
+    pub fn error_code_index(&self) -> usize {
+        2 + self.error_field_offset()
+    }
+
+    /// Field index of the error message text in an error message.
+    pub fn error_message_index(&self) -> usize {
+        3 + self.error_field_offset()
+    }
+
+    /// Extract the request ID from an error message.
+    pub fn error_request_id(&self) -> i32 {
+        self.peek_int(self.error_request_id_index()).unwrap_or(-1)
+    }
+
+    /// Extract the error code from an error message.
+    pub fn error_code(&self) -> i32 {
+        self.peek_int(self.error_code_index()).unwrap_or(0)
+    }
+
+    /// Extract the error message text from an error message.
+    pub fn error_message(&self) -> String {
+        let idx = self.error_message_index();
+        if idx < self.fields.len() {
+            self.peek_string(idx)
+        } else {
+            String::from("Unknown error")
+        }
+    }
+
+    /// Extract the error timestamp from an error message.
+    /// Only present for server versions >= ERROR_TIME.
+    pub fn error_time(&self) -> Option<OffsetDateTime> {
+        if self.server_version >= crate::server_versions::ERROR_TIME {
+            // New format: msg_type, request_id, error_code, error_msg, advanced_order_reject_json, error_time
+            let idx = self.error_message_index() + 2;
+            let millis = self.peek_long(idx).ok()?;
+            OffsetDateTime::from_unix_timestamp_nanos(millis as i128 * 1_000_000).ok()
+        } else {
+            None
+        }
+    }
+
     /// Build a response message from a NUL-delimited payload.
     pub fn from(fields: &str) -> ResponseMessage {
         ResponseMessage {
             i: 0,
             fields: fields.split_terminator('\x00').map(|x| x.to_string()).collect(),
+            server_version: 0,
         }
     }
     #[cfg(test)]
@@ -1069,7 +1139,14 @@ impl ResponseMessage {
         ResponseMessage {
             i: 0,
             fields: fields.split_terminator('|').map(|x| x.to_string()).collect(),
+            server_version: 0,
         }
+    }
+
+    /// Set the server version for version-gated decoding (builder style).
+    pub fn with_server_version(mut self, server_version: i32) -> Self {
+        self.server_version = server_version;
+        self
     }
 
     /// Advance the cursor past the next field.
@@ -1100,6 +1177,9 @@ pub struct Notice {
     pub code: i32,
     /// Human-readable error message text.
     pub message: String,
+    /// Timestamp when the error occurred.
+    /// Only present for server versions >= ERROR_TIME (194).
+    pub error_time: Option<OffsetDateTime>,
 }
 
 /// Error code indicating an order was cancelled (confirmation, not an error).
@@ -1119,9 +1199,10 @@ impl Notice {
     #[allow(private_interfaces)]
     /// Construct a notice from a response message.
     pub fn from(message: &ResponseMessage) -> Notice {
-        let code = message.peek_int(CODE_INDEX).unwrap_or(-1);
-        let message = message.peek_string(MESSAGE_INDEX);
-        Notice { code, message }
+        let code = message.error_code();
+        let error_time = message.error_time();
+        let message = message.error_message();
+        Notice { code, message, error_time }
     }
 
     /// Returns `true` if this notice indicates an order was cancelled (code 202).

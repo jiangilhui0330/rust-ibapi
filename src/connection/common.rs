@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use time::macros::format_description;
 use time::OffsetDateTime;
 use time_tz::{OffsetResult, PrimitiveDateTimeExt, Tz};
@@ -130,7 +130,7 @@ impl Default for ConnectionHandler {
     fn default() -> Self {
         Self {
             min_version: 100,
-            max_version: server_versions::WSH_EVENT_DATA_FILTERS_DATE,
+            max_version: server_versions::CURRENT_TIME_IN_MILLIS,
         }
     }
 }
@@ -193,7 +193,12 @@ impl ConnectionProtocol for ConnectionHandler {
                 info.managed_accounts = Some(message.next_string()?);
             }
             IncomingMessages::Error => {
-                error!("Error during account info: {message:?}");
+                let notice = crate::messages::Notice::from(message);
+                if notice.is_warning() || notice.is_system_message() {
+                    info!("{notice}");
+                } else {
+                    error!("Error during account info: {notice}");
+                }
             }
             _ => {
                 // Pass unsolicited messages to callback if provided

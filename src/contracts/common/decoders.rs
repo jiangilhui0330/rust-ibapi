@@ -1,3 +1,6 @@
+use time::macros::format_description;
+use time::Date;
+
 use crate::{
     contracts::tick_types::TickType,
     contracts::{Currency, Exchange, SecurityType, Symbol},
@@ -25,6 +28,13 @@ pub(in crate::contracts) fn decode_contract_details(server_version: i32, message
     contract.contract.symbol = Symbol::from(message.next_string()?);
     contract.contract.security_type = SecurityType::from(&message.next_string()?);
     read_last_trade_date(&mut contract, &message.next_string()?, false)?;
+    if server_version >= server_versions::LAST_TRADE_DATE {
+        let last_trade_date_str = message.next_string()?;
+        if !last_trade_date_str.is_empty() {
+            let fmt = format_description!("[year][month][day]");
+            contract.contract.last_trade_date = Date::parse(&last_trade_date_str, fmt).ok();
+        }
+    }
     contract.contract.strike = message.next_double()?;
     contract.contract.right = message.next_string()?;
     contract.contract.exchange = Exchange::from(message.next_string()?);

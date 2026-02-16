@@ -146,7 +146,7 @@ impl<S: Stream> Connection<S> {
             trace::blocking::record_response(raw_string.clone());
         }
 
-        let message = ResponseMessage::from(&raw_string);
+        let message = ResponseMessage::from(&raw_string).with_server_version(self.server_version());
 
         self.recorder.record_response(&message);
 

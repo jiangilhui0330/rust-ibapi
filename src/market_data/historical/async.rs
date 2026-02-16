@@ -89,7 +89,17 @@ pub async fn historical_data(
 
         match subscription.next().await {
             Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalData => {
-                return decoders::decode_historical_data(client.server_version(), time_zone(client), &mut message)
+                let mut data = decoders::decode_historical_data(client.server_version(), time_zone(client), &mut message)?;
+
+                if client.server_version() >= crate::server_versions::HISTORICAL_DATA_END {
+                    if let Some(Ok(mut end_msg)) = subscription.next().await {
+                        let (start, end) = decoders::decode_historical_data_end(client.server_version(), time_zone(client), &mut end_msg)?;
+                        data.start = start;
+                        data.end = end;
+                    }
+                }
+
+                return Ok(data);
             }
             Some(Ok(message)) if message.message_type() == IncomingMessages::Error => return Err(Error::from(message)),
             Some(Ok(message)) => return Err(Error::UnexpectedResponse(message)),
@@ -231,6 +241,15 @@ pub async fn historical_ticks_trade(
     let subscription = builder.send_raw(request).await?;
 
     Ok(TickSubscription::new(subscription))
+}
+
+/// Cancels an in-flight historical ticks request.
+pub async fn cancel_historical_ticks(client: &Client, request_id: i32) -> Result<(), Error> {
+    check_version(client.server_version(), Features::CANCEL_CONTRACT_DATA)?;
+
+    let message = encoders::encode_cancel_historical_ticks(request_id)?;
+    client.send_message(message).await?;
+    Ok(())
 }
 
 /// Requests histogram data for a contract.
@@ -386,6 +405,7 @@ impl<T: TickDecoder<T> + Send> TickSubscription<T> {
 ///         HistoricalBarUpdate::Update(bar) => {
 ///             println!("Bar update: {} close={}", bar.date, bar.close);
 ///         }
+///         HistoricalBarUpdate::End { .. } => break,
 ///     }
 /// }
 /// # Ok(())
@@ -485,6 +505,15 @@ impl HistoricalDataStreamingSubscription {
                                 Ok(bar) => {
                                     return Some(HistoricalBarUpdate::Update(bar));
                                 }
+                                Err(e) => {
+                                    self.error = Some(e);
+                                    return None;
+                                }
+                            }
+                        }
+                        IncomingMessages::HistoricalDataEnd => {
+                            match decoders::decode_historical_data_end(self.server_version, self.time_zone, &mut message) {
+                                Ok((start, end)) => return Some(HistoricalBarUpdate::End { start, end }),
                                 Err(e) => {
                                     self.error = Some(e);
                                     return None;

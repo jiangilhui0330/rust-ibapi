@@ -275,7 +275,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 if request_id == UNSPECIFIED_REQUEST_ID || is_warning_error(error_code) {
                     error_event(server_version, message).unwrap();
                 } else {
-                    self.process_response(message, routed);
+                    self.process_response_with_id(request_id, message, routed);
                 }
             }
             RoutingDecision::ByOrderId(_) => {
@@ -290,7 +290,11 @@ impl<S: Stream> TcpMessageBus<S> {
     }
 
     fn process_response(&self, message: ResponseMessage, routed: bool) {
-        let request_id = message.request_id().unwrap_or(-1); // pass in request id?
+        let request_id = message.request_id().unwrap_or(-1);
+        self.process_response_with_id(request_id, message, routed);
+    }
+
+    fn process_response_with_id(&self, request_id: i32, message: ResponseMessage, routed: bool) {
         if self.requests.contains(&request_id) {
             self.requests.send(&request_id, Ok(message)).unwrap();
         } else if self.orders.contains(&request_id) {
@@ -596,33 +600,45 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
 fn error_event(server_version: i32, mut packet: ResponseMessage) -> Result<(), Error> {
     packet.skip(); // message_id
 
-    let version = packet.next_int()?;
-
-    if version < 2 {
-        let message = packet.next_string()?;
-        error!("version 2 error: {message}");
-        Ok(())
-    } else {
+    if server_version >= server_versions::ERROR_TIME {
+        // New format (>= ERROR_TIME): no version field, includes error_time
         let request_id = packet.next_int()?;
         let error_code = packet.next_int()?;
         let error_message = packet.next_string()?;
+        let advanced_order_reject_json = packet.next_string().unwrap_or_default();
+        let error_time = packet.next_long().unwrap_or(0);
+        log_error_fields(request_id, error_code, &error_message, &advanced_order_reject_json, error_time);
+    } else {
+        // Old format (< ERROR_TIME): has version field
+        let version = packet.next_int()?;
 
-        let mut advanced_order_reject_json: String = "".to_string();
-        if server_version >= server_versions::ADVANCED_ORDER_REJECT {
-            advanced_order_reject_json = packet.next_string()?;
-        }
-        // Log warnings and errors differently
-        let is_warning = WARNING_CODES.contains(&error_code);
-        if is_warning {
-            warn!(
-                "request_id: {request_id}, warning_code: {error_code}, warning_message: {error_message}, advanced_order_reject_json: {advanced_order_reject_json}"
-            );
+        if version < 2 {
+            let message = packet.next_string()?;
+            error!("version 2 error: {message}");
         } else {
-            error!(
-                "request_id: {request_id}, error_code: {error_code}, error_message: {error_message}, advanced_order_reject_json: {advanced_order_reject_json}"
-            );
+            let request_id = packet.next_int()?;
+            let error_code = packet.next_int()?;
+            let error_message = packet.next_string()?;
+            let advanced_order_reject_json = if server_version >= server_versions::ADVANCED_ORDER_REJECT {
+                packet.next_string()?
+            } else {
+                String::new()
+            };
+            log_error_fields(request_id, error_code, &error_message, &advanced_order_reject_json, 0);
         }
-        Ok(())
+    }
+    Ok(())
+}
+
+fn log_error_fields(request_id: i32, error_code: i32, error_message: &str, advanced_order_reject_json: &str, error_time: i64) {
+    if WARNING_CODES.contains(&error_code) {
+        warn!(
+            "request_id: {request_id}, warning_code: {error_code}, warning_message: {error_message}, advanced_order_reject_json: {advanced_order_reject_json}, error_time: {error_time}"
+        );
+    } else {
+        error!(
+            "request_id: {request_id}, error_code: {error_code}, error_message: {error_message}, advanced_order_reject_json: {advanced_order_reject_json}, error_time: {error_time}"
+        );
     }
 }
 
@@ -1061,7 +1077,7 @@ mod tests {
         let request = encode_place_order(176, 5, contract, &order)?;
 
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250415 19:38:30 British Summer Time|"]),
+            Exchange::simple("v100..197", &["173|20250415 19:38:30 British Summer Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|5|"]),
             Exchange::request(request.clone(),
                 &[
@@ -1094,7 +1110,7 @@ mod tests {
     #[test]
     fn test_connection_establish_connection() -> Result<(), Error> {
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple(
                 "71|2|28||",
                 &[
@@ -1116,7 +1132,7 @@ mod tests {
     #[test]
     fn test_reconnect_failed() -> Result<(), Error> {
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|", "\0"]), // RESTART
         ];
         let socket = MockSocket::new(events, MAX_RECONNECT_ATTEMPTS as usize + 1);
@@ -1136,9 +1152,9 @@ mod tests {
     #[test]
     fn test_reconnect_success() -> Result<(), Error> {
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|", "\0"]), // RESTART
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
         ];
         let socket = MockSocket::new(events, MAX_RECONNECT_ATTEMPTS as usize - 1);
@@ -1155,10 +1171,10 @@ mod tests {
     #[test]
     fn test_client_reconnect() -> Result<(), Error> {
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
             Exchange::simple("17|1|", &["\0"]), // ManagedAccounts RESTART
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
             Exchange::simple("17|1|", &["15|1|DU1234567|"]), // ManagedAccounts
         ];
@@ -1184,9 +1200,9 @@ mod tests {
         let expected_response = &format!("10|9000|{AAPL_CONTRACT_RESPONSE}");
 
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|", "\0"]), // RESTART
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
             Exchange::request(packet.clone(), &[expected_response, "52|1|9001|"]),
         ];
@@ -1218,10 +1234,10 @@ mod tests {
         let packet = encode_request_contract_data(173, 9000, &Contract::stock("AAPL").build())?;
 
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
             Exchange::request(packet.clone(), &["\0"]), // RESTART
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
         ];
 
@@ -1250,9 +1266,9 @@ mod tests {
         let packet = encode_request_contract_data(173, 9000, &Contract::stock("AAPL").build())?;
 
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|", "\0"]), // RESTART
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::request(packet.clone(), &[]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
         ];
@@ -1282,10 +1298,10 @@ mod tests {
         let packet = encode_request_contract_data(173, 9000, contract)?;
 
         let events = vec![
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
             Exchange::request(packet.clone(), &["\0"]),
-            Exchange::simple("v100..173", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
+            Exchange::simple("v100..197", &["173|20250323 22:21:01 Greenwich Mean Time|"]),
             Exchange::simple("71|2|28||", &["15|1|DU1234567|", "9|1|1|"]),
         ];
 

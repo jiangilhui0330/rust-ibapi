@@ -140,6 +140,19 @@ pub fn server_time(client: &Client) -> Result<OffsetDateTime, Error> {
     )
 }
 
+/// Query the current server time in milliseconds reported by TWS or IB Gateway.
+pub fn server_time_millis(client: &Client) -> Result<OffsetDateTime, Error> {
+    check_version(client.server_version, Features::CURRENT_TIME_IN_MILLIS)?;
+
+    crate::common::request_helpers::blocking::one_shot_with_retry(
+        client,
+        OutgoingMessages::RequestCurrentTimeInMillis,
+        encoders::encode_request_server_time_millis,
+        decoders::decode_server_time_millis,
+        || Err(Error::Simple("No response from server".to_string())),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::accounts::types::{AccountGroup, AccountId, ContractId, ModelCode};

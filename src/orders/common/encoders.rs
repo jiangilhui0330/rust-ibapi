@@ -417,11 +417,28 @@ pub(crate) fn encode_cancel_order(server_version: i32, order_id: i32, manual_ord
     let mut message = RequestMessage::default();
 
     message.push_field(&OutgoingMessages::CancelOrder);
-    message.push_field(&VERSION);
+
+    if server_version < server_versions::CME_TAGGING_FIELDS {
+        message.push_field(&VERSION);
+    }
+
     message.push_field(&order_id);
 
     if server_version >= server_versions::MANUAL_ORDER_TIME {
         message.push_field(&manual_order_cancel_time);
+    }
+
+    // Cancel order sends 3 RFQ placeholder fields (vs 2 in place_order),
+    // per official TWS API EClient.cancelOrder() — the extra field is for ext_operator.
+    if (server_versions::RFQ_FIELDS..server_versions::UNDO_RFQ_FIELDS).contains(&server_version) {
+        message.push_field(&"");
+        message.push_field(&"");
+        message.push_field(&i32::MAX);
+    }
+
+    if server_version >= server_versions::CME_TAGGING_FIELDS {
+        message.push_field(&""); // ext_operator (CME Rule 576)
+        message.push_field(&i32::MAX); // manual_order_indicator (UNSET)
     }
 
     Ok(message)
@@ -1000,5 +1017,68 @@ pub(crate) mod tests {
         assert_eq!(field_vec[len - 2], "1", "include_overnight");
         assert_eq!(field_vec[len - 3], "1", "professional_customer");
         assert_eq!(field_vec[len - 4], "CUST001", "customer_account");
+    }
+
+    #[test]
+    fn test_encode_cancel_order_old_server() {
+        // Server version 164 < MANUAL_ORDER_TIME=169: only VERSION + order_id
+        let result = encode_cancel_order(164, 41, "").unwrap();
+        assert_eq!(result.encode(), "4\x001\x0041\x00");
+    }
+
+    #[test]
+    fn test_encode_cancel_order_with_manual_time() {
+        // Server version 170 >= MANUAL_ORDER_TIME=169, < RFQ_FIELDS=187
+        let result = encode_cancel_order(170, 41, "20260101-12:00:00").unwrap();
+        let fields = result.encode();
+        let field_vec: Vec<&str> = fields.split('\0').collect();
+        assert_eq!(field_vec[0], "4", "msg type");
+        assert_eq!(field_vec[1], "1", "VERSION present");
+        assert_eq!(field_vec[2], "41", "order_id");
+        assert_eq!(field_vec[3], "20260101-12:00:00", "manual_order_cancel_time");
+    }
+
+    #[test]
+    fn test_encode_cancel_order_v188_rfq_fields() {
+        // v188 is in range [RFQ_FIELDS=187, UNDO_RFQ_FIELDS=190)
+        let result = encode_cancel_order(188, 42, "").unwrap();
+        let fields = result.encode();
+        let field_vec: Vec<&str> = fields.split('\0').collect();
+        assert_eq!(field_vec[0], "4", "msg type");
+        assert_eq!(field_vec[1], "1", "VERSION present (< 192)");
+        assert_eq!(field_vec[2], "42", "order_id");
+        assert_eq!(field_vec[3], "", "manual_order_cancel_time (>= 169)");
+        // 3 RFQ placeholder fields
+        assert_eq!(field_vec[4], "", "RFQ field 1");
+        assert_eq!(field_vec[5], "", "RFQ field 2");
+        assert_eq!(field_vec[6], "2147483647", "RFQ field 3 (UNSET_INT)");
+    }
+
+    #[test]
+    fn test_encode_cancel_order_v191_no_rfq() {
+        // v191 >= UNDO_RFQ_FIELDS=190 (no RFQ), < CME_TAGGING_FIELDS=192
+        let result = encode_cancel_order(191, 42, "").unwrap();
+        let fields = result.encode();
+        let field_vec: Vec<&str> = fields.split('\0').collect();
+        assert_eq!(field_vec[0], "4", "msg type");
+        assert_eq!(field_vec[1], "1", "VERSION present (< 192)");
+        assert_eq!(field_vec[2], "42", "order_id");
+        assert_eq!(field_vec[3], "", "manual_order_cancel_time");
+        assert_eq!(field_vec.len(), 5, "no RFQ, no CME fields (trailing empty)");
+    }
+
+    #[test]
+    fn test_encode_cancel_order_v192_cme_tagging() {
+        // v192 >= CME_TAGGING_FIELDS: no VERSION, has CME fields
+        let result = encode_cancel_order(192, 42, "").unwrap();
+        let fields = result.encode();
+        let field_vec: Vec<&str> = fields.split('\0').collect();
+        assert_eq!(field_vec[0], "4", "msg type");
+        assert_eq!(field_vec[1], "42", "order_id (no VERSION)");
+        assert_eq!(field_vec[2], "", "manual_order_cancel_time");
+        // No RFQ fields (>= UNDO_RFQ_FIELDS=190)
+        assert_eq!(field_vec[3], "", "ext_operator");
+        assert_eq!(field_vec[4], "2147483647", "manual_order_indicator (UNSET)");
+        assert_eq!(field_vec.len(), 6, "5 fields + trailing empty");
     }
 }
